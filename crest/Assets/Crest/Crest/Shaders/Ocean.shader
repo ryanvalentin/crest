@@ -6,6 +6,7 @@ Shader "Crest/Ocean"
 {
 	Properties
 	{
+		[Toggle] _EnableFix("Enable Fix", Float) = 1
 		[Header(Normal Mapping)]
 		// Whether to add normal detail from a texture. Can be used to add visual detail to the water surface
 		[Toggle] _ApplyNormalMapping("Enable", Float) = 1
@@ -265,6 +266,8 @@ Shader "Crest/Ocean"
 			#include "OceanHelpersNew.hlsl"
 			#include "OceanHelpers.hlsl"
 
+			float _EnableFix;
+
 			// Argument name is v because some macros like COMPUTE_EYEDEPTH require it.
 			Varyings Vert(Attributes v)
 			{
@@ -329,7 +332,8 @@ Shader "Crest/Ocean"
 				}
 
 				// Data that needs to be sampled at the displaced position
-				if (wt_smallerLod > 0.0001)
+				if (wt_smallerLod > (_EnableFix ? 0.0001 : 0.001))
+				// if (wt_smallerLod > 0.001)
 				{
 					const float3 uv_slice_smallerLodDisp = WorldToUV(o.worldPos.xz);
 
@@ -344,7 +348,8 @@ Shader "Crest/Ocean"
 					}
 					#endif
 				}
-				if (wt_biggerLod > 0.0001)
+				if (wt_biggerLod > (_EnableFix ? 0.0001 : 0.001))
+				// if (wt_biggerLod > 0.001)
 				{
 					const float3 uv_slice_biggerLodDisp = WorldToUV_BiggerLod(o.worldPos.xz);
 
