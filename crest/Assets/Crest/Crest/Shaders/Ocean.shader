@@ -237,6 +237,13 @@ Shader "Crest/Ocean"
 			#include "UnityCG.cginc"
 			#include "Lighting.cginc"
 
+			// Added by Ryan: Overcloud compatibility
+			/*
+			On line 214, under '#include "Lighting.cginc"', add:
+			*/
+			#include "Assets/OverCloud/OverCloudInclude.cginc"
+            // End added by Ryan.
+
 			struct Attributes
 			{
 				// The old unity macros require this name and type.
@@ -435,6 +442,14 @@ Shader "Crest/Ocean"
 				#endif
 					;
 
+                // Added by Ryan: OverCloud compatibility
+                /*
+                In Crest/Crest/Shaders/Ocean.shader, around line 414, just after the code add:
+                */
+                float cloudShadowIntensity = 1.0;
+                shadow *= CloudShadows(input.worldPos, cloudShadowIntensity);
+                // End added by Ryan.
+
 				// Normal - geom + normal mapping. Subsurface scattering.
 				const float3 uv_slice_smallerLod = WorldToUV(input.lodAlpha_worldXZUndisplaced_oceanDepth.yz);
 				const float3 uv_slice_biggerLod = WorldToUV_BiggerLod(input.lodAlpha_worldXZUndisplaced_oceanDepth.yz);
@@ -519,7 +534,17 @@ Shader "Crest/Ocean"
 				if (!underwater)
 				{
 					// Above water - do atmospheric fog. If you are using a third party sky package such as Azure, replace this with their stuff!
-					UNITY_APPLY_FOG(input.fogCoord, col);
+					// UNITY_APPLY_FOG(input.fogCoord, col);
+
+					// Added by Ryan: Overcloud compatibility
+					/*
+					Comment out line 474 (the one that says 'UNITY_APPLY_FOG(input.fogCoord, col);') and instead, replace it with the lines:
+					*/
+                    float4 col4 = float4(col, 1.0);
+                    OVERCLOUD_FRAGMENT_FULL(col4, uvDepth, input.worldPos)
+                    OVERCLOUD_OCEAN_BASE(col4, uvDepth, input.worldPos)
+                    col = col4.rgb;
+                    // End added by Ryan.
 				}
 				else
 				{
