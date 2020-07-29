@@ -253,7 +253,7 @@ Shader "Crest/Ocean"
 			/*
 			On line 214, under '#include "Lighting.cginc"', add:
 			*/
-			#include "Assets/OverCloud/OverCloudInclude.cginc"
+			#include "../../../OverCloud/OverCloudInclude.cginc"
             // End added by Ryan.
 
 			struct Attributes
