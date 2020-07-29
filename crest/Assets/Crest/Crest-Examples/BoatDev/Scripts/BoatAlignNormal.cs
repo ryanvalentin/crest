@@ -128,15 +128,25 @@ public class BoatAlignNormal : FloatingObjectBase
         _rb.AddForceAtPosition(transform.forward * Vector3.Dot(transform.forward, -velocityRelativeToWater) * _dragInWaterForward, forcePosition, ForceMode.Acceleration);
 
         float forward = _throttleBias;
-        float rawForward = Input.GetAxis("Vertical");
+        float rawForward = 0f;
+#if ENABLE_INPUT_SYSTEM
+        // TODO: New input system.
+#elif ENABLE_LEGACY_INPUT_MANAGER
+        rawForward = Input.GetAxis("Vertical");
+#endif
         if (_playerControlled) forward += rawForward;
         _rb.AddForceAtPosition(transform.forward * _enginePower * forward, forcePosition, ForceMode.Acceleration);
 
         float reverseMultiplier = (rawForward < 0f ? -1f : 1f);
         float sideways = _steerBias;
+#if ENABLE_INPUT_SYSTEM
+        // TODO: Add new inputsystem.
+#elif ENABLE_LEGACY_INPUT_MANAGER
         if (_playerControlled) sideways +=
-                (Input.GetKey(KeyCode.A) ? reverseMultiplier * -1f : 0f) +
-                (Input.GetKey(KeyCode.D) ? reverseMultiplier * 1f : 0f);
+            (Input.GetKey(KeyCode.A) ? reverseMultiplier * -1f : 0f) +
+            (Input.GetKey(KeyCode.D) ? reverseMultiplier * 1f : 0f);
+#endif
+
         _rb.AddTorque(transform.up * _turnPower * sideways, ForceMode.Acceleration);
 
         FixedUpdateOrientation(normal);

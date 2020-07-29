@@ -143,11 +143,20 @@ namespace Crest
             var forcePosition = _rb.position;
 
             var forward = _engineBias;
+#if ENABLE_INPUT_SYSTEM
+            // TODO: Add new inputsystem.
+#elif ENABLE_LEGACY_INPUT_MANAGER
             if (_playerControlled) forward += Input.GetAxis("Vertical");
+#endif
+
             _rb.AddForceAtPosition(transform.forward * _enginePower * forward, forcePosition, ForceMode.Acceleration);
 
             var sideways = _turnBias;
+#if ENABLE_INPUT_SYSTEM
+            // TODO: Add new inputsystem.
+#elif ENABLE_LEGACY_INPUT_MANAGER
             if (_playerControlled) sideways += (Input.GetKey(KeyCode.A) ? -1f : 0f) + (Input.GetKey(KeyCode.D) ? 1f : 0f);
+#endif
             var rotVec = transform.up + _turningHeel * transform.forward;
             _rb.AddTorque(rotVec * _turnPower * sideways, ForceMode.Acceleration);
         }

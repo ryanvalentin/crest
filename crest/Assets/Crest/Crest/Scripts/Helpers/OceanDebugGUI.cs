@@ -39,6 +39,9 @@ namespace Crest
 
         private void Update()
         {
+#if ENABLE_INPUT_SYSTEM
+    // New input system backends are enabled.
+#elif ENABLE_LEGACY_INPUT_MANAGER
             if (Input.GetKeyDown(KeyCode.G))
             {
                 ToggleGUI();
@@ -51,6 +54,7 @@ namespace Crest
             {
                 SceneManager.LoadScene(SceneManager.GetSceneAt(0).buildIndex);
             }
+#endif
         }
 
         void OnGUI()
