@@ -39,12 +39,14 @@ Shader "Crest/Underwater Curtain"
 
 			#pragma multi_compile_instancing
 
-			#pragma shader_feature_local _SUBSURFACESCATTERING_ON
-			#pragma shader_feature_local _SUBSURFACESHALLOWCOLOUR_ON
-			#pragma shader_feature_local _TRANSPARENCY_ON
-			#pragma shader_feature_local _CAUSTICS_ON
-			#pragma shader_feature_local _SHADOWS_ON
-			#pragma shader_feature_local _COMPILESHADERWITHDEBUGINFO_ON
+			// Use multi_compile because these keywords are copied over from the ocean material. With shader_feature,
+			// the keywords would be stripped from builds. Unused shader variants are stripped using a build processor.
+			#pragma multi_compile_local __ _SUBSURFACESCATTERING_ON
+			#pragma multi_compile_local __ _SUBSURFACESHALLOWCOLOUR_ON
+			#pragma multi_compile_local __ _TRANSPARENCY_ON
+			#pragma multi_compile_local __ _CAUSTICS_ON
+			#pragma multi_compile_local __ _SHADOWS_ON
+			#pragma multi_compile_local __ _COMPILESHADERWITHDEBUGINFO_ON
 
 			#if _COMPILESHADERWITHDEBUGINFO_ON
 			#pragma enable_d3d11_debug_symbols
@@ -55,17 +57,14 @@ Shader "Crest/Underwater Curtain"
 
 			#include "../OceanGlobals.hlsl"
 			#include "../OceanInputsDriven.hlsl"
+			#include "../OceanShaderData.hlsl"
 			#include "../OceanHelpersNew.hlsl"
+			#include "../OceanShaderHelpers.hlsl"
 			#include "UnderwaterShared.hlsl"
-
-			float _HeightOffset;
-			UNITY_DECLARE_SCREENSPACE_TEXTURE(_CameraDepthTexture);
 
 			#include "../OceanEmission.hlsl"
 
 			#define MAX_OFFSET 5.0
-
-			sampler2D _Normals;
 
 			struct Attributes
 			{
@@ -197,14 +196,10 @@ Shader "Crest/Underwater Curtain"
 				const half3 n_pixel = 0.0;
 				const half3 bubbleCol = 0.0;
 
-				float3 dummy = 0.0;
-				half sss = 0.;
-				const float3 uv_slice = WorldToUV(_WorldSpaceCameraPos.xz, cascadeData0, _LD_SliceIndex);
-				SampleDisplacements(_LD_TexArray_AnimatedWaves, uv_slice, 1.0, dummy, sss);
-
-				// depth and shadow are computed in ScatterColour when underwater==true, using the LOD1 texture.
+				// Depth and shadow are computed in ScatterColour when underwater==true, using the LOD1 texture. SSS is ommitted for now for perf reasons.
 				const float depth = 0.0;
 				const half shadow = 1.0;
+				const half sss = 0.0;
 
 				const float meshScaleLerp = _CrestPerCascadeInstanceData[_LD_SliceIndex]._meshScaleLerp;
 				const float baseCascadeScale = _CrestCascadeData[0]._scale;

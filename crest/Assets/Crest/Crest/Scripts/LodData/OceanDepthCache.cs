@@ -2,11 +2,8 @@
 
 // This file is subject to the MIT License as seen in the root of this folder structure (LICENSE)
 
-// This is the original version that uses an auxillary camera and works with Unity's GPU terrain - issue 152.
-
 using System;
 using UnityEngine;
-using UnityEngine.Rendering;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -19,6 +16,8 @@ namespace Crest
     /// This should be used for static geometry, dynamic objects should be tagged with the Render Ocean Depth component.
     /// </summary>
     [ExecuteAlways]
+    [HelpURL("https://crest.readthedocs.io/en/latest/user/shallows-and-shorelines.html")]
+    [AddComponentMenu(Internal.Constants.MENU_PREFIX_SCRIPTS + "Ocean Depth Cache")]
     public partial class OceanDepthCache : MonoBehaviour
     {
         public enum OceanDepthCacheType
@@ -41,10 +40,10 @@ namespace Crest
         OceanDepthCacheRefreshMode _refreshMode = OceanDepthCacheRefreshMode.OnStart;
         public OceanDepthCacheRefreshMode RefreshMode => _refreshMode;
 
-        [Tooltip("Renderers in scene to render into this depth cache. When provided this saves the code from doing an expensive FindObjectsOfType() call. If one or more renderers are specified, the layer setting is ignored."), SerializeField]
-        Renderer[] _geometryToRenderIntoCache = new Renderer[0];
+        [Tooltip("The layers to render into the depth cache.")]
+        public LayerMask _layers = 1; // Default
 
-        [Tooltip("The layers to render into the depth cache. This is ignored if geometry instances are specified in the Geometry To Render Into Cache field.")]
+        [Obsolete("Layer Names (string[] _layerNames) is obsolete and is no longer used. Use Layers (LayerMask _layers) instead."), HideInInspector]
         public string[] _layerNames = new string[0];
 
         [Tooltip("The resolution of the cached depth - lower will be more efficient.")]
@@ -68,40 +67,26 @@ namespace Crest
 #pragma warning restore 649
         public Texture2D SavedCache => _savedCache;
 
-        [Tooltip("Check for any terrains that have the 'Draw Instanced' option enabled. Such instanced terrains will not populate into the depth cache and therefore will not contribute to shorelines and shallow water. This option must be disabled on the terrain when the depth cache is populated (but can be enabled afterwards)."), SerializeField]
-#pragma warning disable 414
-        bool _checkTerrainDrawInstancedOption = true;
-#pragma warning restore 414
-
 #pragma warning disable 414
         [Tooltip("Editor only: run validation checks on Start() to check for issues."), SerializeField]
         bool _runValidationOnStart = true;
 #pragma warning restore 414
 
-        [Header("Signed Distance Field (Experimental)")]
-        [Tooltip("Generate a signed distance field (experimental)"), SerializeField]
-        internal bool _generateSDF = false;
+        RenderTexture _cacheTexture;
+        public RenderTexture CacheTexture => _cacheTexture;
 
-        [PredicatedField("_generateSDF")]
-        [Tooltip("How many additional Jump Flood Algorithm rounds to use - (over the standard log2(Resolution)"), SerializeField]
-        // additional rounds of jump flood can help reduce innacuracies from JFA, see paper for details.
-        int _additionalJumpFloodRounds = 7;
-
-        RenderTexture _depthCacheTexture;
-        public RenderTexture CacheTexture => _depthCacheTexture;
-
-        GameObject _drawDepthCacheQuad;
-        Camera _depthCacheCamera;
-
-        private readonly int sp_jumpSize = Shader.PropertyToID("_jumpSize");
-        private readonly int sp_textureDimension = Shader.PropertyToID("_textureDimension");
-        private readonly int sp_projectionToWorld = Shader.PropertyToID("_projectionToWorld");
-        private readonly int sp_InitTexture = Shader.PropertyToID("_InitTexture");
-        private readonly int sp_FromTexture = Shader.PropertyToID("_FromTexture");
-        private readonly int sp_ToTexture = Shader.PropertyToID("_ToTexture");
+        GameObject _drawCacheQuad;
+        Camera _camDepthCache;
+        Material _copyDepthMaterial;
 
         void Start()
         {
+            if (OceanRenderer.Instance == null)
+            {
+                enabled = false;
+                return;
+            }
+
 #if UNITY_EDITOR
             if (EditorApplication.isPlaying && _runValidationOnStart)
             {
@@ -111,7 +96,7 @@ namespace Crest
 
             if (_type == OceanDepthCacheType.Baked)
             {
-                DrawCacheQuad(ref _drawDepthCacheQuad, "DepthCache_", _type, _savedCache);
+                InitCacheQuad();
             }
             else if (_type == OceanDepthCacheType.Realtime && _refreshMode == OceanDepthCacheRefreshMode.OnStart)
             {
@@ -122,317 +107,210 @@ namespace Crest
 #if UNITY_EDITOR
         void Update()
         {
+            // We need to switch the quad texture if the user changes the cache type in the editor.
+            InitCacheQuad();
+
             if (_forceAlwaysUpdateDebug)
             {
-                PopulateCache();
+                PopulateCache(updateComponents: true);
             }
         }
 #endif
 
-        public void PopulateCache()
+        float CalculateCacheCameraOrthographicSize()
         {
-            if (_type == OceanDepthCacheType.Baked)
-                return;
+            return Mathf.Max(transform.lossyScale.x / 2f, transform.lossyScale.z / 2f);
+        }
 
-            var layerMask = 0;
-            var errorShown = false;
-            foreach (var layer in _layerNames)
+        Vector3 CalculateCacheCameraPosition()
+        {
+            return transform.position + Vector3.up * _cameraMaxTerrainHeight;
+        }
+
+        bool IsCacheTextureOutdated(RenderTexture texture)
+        {
+            return texture != null && (texture.width != _resolution || texture.height != _resolution);
+        }
+
+        RenderTexture MakeRT(bool depthStencilTarget)
+        {
+            RenderTextureFormat fmt;
+
+            if (depthStencilTarget)
             {
-                if (string.IsNullOrEmpty(layer))
-                {
-                    Debug.LogError("OceanDepthCache: An empty layer name was provided. Please provide a valid layer name. Click this message to highlight the cache in question.", this);
-                    errorShown = true;
-                    continue;
-                }
-
-                int layerIdx = LayerMask.NameToLayer(layer);
-                if (layerIdx == -1)
-                {
-                    Debug.LogError("OceanDepthCache: Invalid layer specified: \"" + layer +
-                        "\". Please add this layer to the project by putting the name in an empty layer slot in Edit/Project Settings/Tags and Layers. Click this message to highlight the cache in question.", this);
-
-                    errorShown = true;
-                }
-                else
-                {
-                    layerMask = layerMask | (1 << layerIdx);
-                }
+                fmt = RenderTextureFormat.Depth;
             }
-
-            if (layerMask == 0)
+            else
             {
-                if (!errorShown)
-                {
-                    Debug.LogError("No valid layers for populating depth cache, aborting. Click this message to highlight the cache in question.", this);
-                }
-
-                return;
-            }
-
-#if UNITY_EDITOR
-            if (_type == OceanDepthCacheType.Realtime && _checkTerrainDrawInstancedOption)
-            {
-                // This issue only affects the built-in render pipeline. Issue 158: https://github.com/crest-ocean/crest/issues/158
-
-                var terrains = FindObjectsOfType<Terrain>();
-                foreach (var terrain in terrains)
-                {
-                    var mask = (int)Mathf.Pow(2f, terrain.gameObject.layer);
-
-                    if ((mask & layerMask) == 0) continue;
-
-                    if (terrain.drawInstanced)
-                    {
-                        Debug.LogError($"Terrain {terrain.gameObject.name} has 'Draw Instanced' enabled. This terrain will not populate into the depth cache and therefore will not contribute to shorelines and shallow water. This option must be disabled on the terrain when the depth cache is populated (but can be enabled afterwards).", terrain);
-                    }
-                }
-            }
-#endif
-
-            if (_depthCacheTexture == null)
-            {
-                RenderTextureFormat fmt;
-                if (_generateSDF)
-                {
-                    fmt = RenderTextureFormat.RGHalf;
-                }
-                else
-                {
 #if UNITY_EDITOR_WIN
-                    fmt = RenderTextureFormat.DefaultHDR;
+                fmt = RenderTextureFormat.DefaultHDR;
 #else
-                    fmt = RenderTextureFormat.RHalf;
+                fmt = RenderTextureFormat.RHalf;
 #endif
-                }
-
-                Debug.Assert(SystemInfo.SupportsRenderTextureFormat(fmt), "The graphics device does not support the render texture format " + fmt.ToString());
-                _depthCacheTexture = new RenderTexture(_resolution, _resolution, 0);
-                _depthCacheTexture.name = gameObject.name + "_oceanDepth";
-                _depthCacheTexture.format = fmt;
-                _depthCacheTexture.useMipMap = false;
-                _depthCacheTexture.anisoLevel = 0;
-                _depthCacheTexture.enableRandomWrite = _generateSDF;
-                _depthCacheTexture.Create();
             }
 
-            if (_depthCacheCamera == null)
+            Debug.Assert(SystemInfo.SupportsRenderTextureFormat(fmt), "The graphics device does not support the render texture format " + fmt.ToString());
+            var result = new RenderTexture(_resolution, _resolution, depthStencilTarget ? 24 : 0);
+            result.name = gameObject.name + "_oceanDepth_" + (depthStencilTarget ? "DepthOnly" : "Cache");
+            result.format = fmt;
+            result.useMipMap = false;
+            result.anisoLevel = 0;
+            return result;
+        }
+
+        bool InitObjects(bool updateComponents)
+        {
+            if (updateComponents && IsCacheTextureOutdated(_cacheTexture))
             {
-                _depthCacheCamera = GenerateCacheCamera(
-                    layerMask,
-                    _generateSDF ? "DepthSdfCam" : "DepthCacheCam",
-                    _cameraMaxTerrainHeight,
-                    transform,
-                    _depthCacheTexture,
-                    _hideDepthCacheCam
-                );
+                // Destroy the texture so it can be recreated.
+                _cacheTexture.Release();
+                _cacheTexture = null;
             }
 
+            if (_cacheTexture == null)
+            {
+                _cacheTexture = MakeRT(false);
+            }
 
-            // Make sure this global is set - I found this was necessary to set it here. However this can cause glitchiness in editor
-            // as it messes with this global vector, so only do it if not in edit mode
+            // We want to know this later.
+            var isDepthCacheCameraCreation = _camDepthCache == null;
+
+            if (_layers == 0)
+            {
+                Debug.LogError("No valid layers for populating depth cache, aborting.", this);
+                return false;
+            }
+
+            if (isDepthCacheCameraCreation)
+            {
+                _camDepthCache = new GameObject("DepthCacheCam").AddComponent<Camera>();
+                _camDepthCache.transform.parent = transform;
+                _camDepthCache.transform.localEulerAngles = 90f * Vector3.right;
+                _camDepthCache.orthographic = true;
+                _camDepthCache.clearFlags = CameraClearFlags.SolidColor;
+                // Clear to 'very deep'
+                _camDepthCache.backgroundColor = Color.white * 1000f;
+                _camDepthCache.enabled = false;
+                _camDepthCache.allowMSAA = false;
+                // Stops behaviour from changing in VR. I tried disabling XR before/after camera render but it makes the editor
+                // go bonkers with split windows.
+                _camDepthCache.cameraType = CameraType.Reflection;
+                // I'd prefer to destroy the camera object, but I found sometimes (on first start of editor) it will fail to render.
+                _camDepthCache.gameObject.SetActive(false);
+            }
+
+            if (updateComponents || isDepthCacheCameraCreation)
+            {
+                // Calculate here so it is always updated.
+                _camDepthCache.transform.position = CalculateCacheCameraPosition();
+                _camDepthCache.orthographicSize = CalculateCacheCameraOrthographicSize();
+                _camDepthCache.cullingMask = _layers;
+                _camDepthCache.gameObject.hideFlags = _hideDepthCacheCam ? HideFlags.HideAndDontSave : HideFlags.DontSave;
+            }
+
+            if (updateComponents && IsCacheTextureOutdated(_camDepthCache.targetTexture))
+            {
+                // Destroy the texture so it can be recreated.
+                _camDepthCache.targetTexture.Release();
+                _camDepthCache.targetTexture = null;
+            }
+
+            if (_camDepthCache.targetTexture == null)
+            {
+                _camDepthCache.targetTexture = MakeRT(true);
+            }
+
+            InitCacheQuad();
+
+            return true;
+        }
+
+        void InitCacheQuad()
+        {
+            Renderer qr;
+
+            if (_drawCacheQuad == null)
+            {
+                _drawCacheQuad = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                _drawCacheQuad.hideFlags = HideFlags.DontSave;
 #if UNITY_EDITOR
-            if (EditorApplication.isPlaying)
+                DestroyImmediate(_drawCacheQuad.GetComponent<Collider>());
+#else
+                Destroy(_drawCacheQuad.GetComponent<Collider>());
 #endif
-            {
-                // Shader needs sea level to determine water depth
-                var centerPoint = Vector3.zero;
-                if (OceanRenderer.Instance != null)
-                {
-                    centerPoint.y = OceanRenderer.Instance.Root.position.y;
-                }
-                else
-                {
-                    centerPoint.y = transform.position.y;
-                }
-
-                Shader.SetGlobalVector("_OceanCenterPosWorld", centerPoint);
-            }
-
-            _depthCacheCamera.RenderWithShader(Shader.Find("Crest/Inputs/Depth/Ocean Depth From Geometry"), null);
-
-            if (_generateSDF)
-            {
-                RenderTextureFormat fmt = RenderTextureFormat.RGHalf;
-                RenderTexture voronoiPingPongTexture0 = new RenderTexture(_resolution, _resolution, 0);
-                voronoiPingPongTexture0.name = gameObject.name + "_voronoiPingPong0";
-                voronoiPingPongTexture0.format = fmt;
-                voronoiPingPongTexture0.useMipMap = false;
-                voronoiPingPongTexture0.anisoLevel = 0;
-                voronoiPingPongTexture0.enableRandomWrite = true;
-                voronoiPingPongTexture0.Create();
-
-                RenderTexture voronoiPingPongTexture1 = new RenderTexture(_resolution, _resolution, 0);
-                voronoiPingPongTexture1.name = gameObject.name + "_voronoiPingPong1";
-                voronoiPingPongTexture1.format = fmt;
-                voronoiPingPongTexture1.useMipMap = false;
-                voronoiPingPongTexture1.anisoLevel = 0;
-                voronoiPingPongTexture1.enableRandomWrite = true;
-                voronoiPingPongTexture1.Create();
-
-                using (CommandBuffer jumpFloodCommandBuffer = new CommandBuffer())
-                {
-                    var cameraToWorldMatrix = _depthCacheCamera.cameraToWorldMatrix;
-                    var projectionMatrix = _depthCacheCamera.projectionMatrix;
-                    var projectionToWorldMatrix = cameraToWorldMatrix * projectionMatrix.inverse;
-                    uint textureDimension = (uint)voronoiPingPongTexture0.width;
-                    {
-                        ComputeShader initJumpFloodShader = ComputeShaderHelpers.LoadShader("SdfInitJumpFlood");
-                        int initJumpFloodKernel = initJumpFloodShader.FindKernel("SdfInitJumpFlood");
-                        jumpFloodCommandBuffer.SetComputeTextureParam(initJumpFloodShader, initJumpFloodKernel, sp_FromTexture, _depthCacheTexture);
-                        jumpFloodCommandBuffer.SetComputeTextureParam(initJumpFloodShader, initJumpFloodKernel, sp_ToTexture, voronoiPingPongTexture0);
-                        jumpFloodCommandBuffer.SetComputeIntParam(initJumpFloodShader, sp_textureDimension, (int)textureDimension);
-                        jumpFloodCommandBuffer.SetComputeMatrixParam(initJumpFloodShader, sp_projectionToWorld, projectionToWorldMatrix);
-                        jumpFloodCommandBuffer.DispatchCompute(
-                            initJumpFloodShader,
-                            initJumpFloodKernel,
-                            _depthCacheTexture.width / 8,
-                            _depthCacheTexture.height / 8,
-                            1
-                        );
-                    }
-                    ComputeShader jumpFloodShader = ComputeShaderHelpers.LoadShader("SdfJumpFlood");
-                    int jumpFloodKernel = jumpFloodShader.FindKernel("SdfJumpFlood");
-
-                    ComputeShader sdfGradientShader = ComputeShaderHelpers.LoadShader("SdfApply");
-                    int sdfKernel = sdfGradientShader.FindKernel("SdfApply");
-
-
-                    jumpFloodCommandBuffer.name = "Jump Flood";
-                    for (uint jumpSize = (uint)textureDimension / 2; jumpSize > 0; jumpSize /= 2)
-                    {
-                        ApplyJumpFlood(
-                            jumpFloodCommandBuffer, jumpFloodShader, jumpFloodKernel,
-                            sp_jumpSize, jumpSize,
-                            sp_textureDimension, textureDimension,
-                            sp_projectionToWorld, projectionToWorldMatrix,
-                            sp_FromTexture, voronoiPingPongTexture0,
-                            sp_ToTexture, voronoiPingPongTexture1
-                        );
-                        LodDataMgr.Swap(ref voronoiPingPongTexture1, ref voronoiPingPongTexture0);
-                    }
-
-                    for (uint roundNum = 0; roundNum < _additionalJumpFloodRounds; roundNum++)
-                    {
-                        uint jumpSize = (uint)1 << (int)roundNum;
-                        ApplyJumpFlood(
-                            jumpFloodCommandBuffer, jumpFloodShader, jumpFloodKernel,
-                            sp_jumpSize, jumpSize,
-                            sp_textureDimension, textureDimension,
-                            sp_projectionToWorld, projectionToWorldMatrix,
-                            sp_FromTexture, voronoiPingPongTexture0,
-                            sp_ToTexture, voronoiPingPongTexture1
-                        );
-                        LodDataMgr.Swap(ref voronoiPingPongTexture1, ref voronoiPingPongTexture0);
-                    }
-
-                    jumpFloodCommandBuffer.SetComputeTextureParam(sdfGradientShader, sdfKernel, sp_FromTexture, voronoiPingPongTexture0);
-                    jumpFloodCommandBuffer.SetComputeTextureParam(sdfGradientShader, sdfKernel, sp_ToTexture, _depthCacheTexture);
-                    jumpFloodCommandBuffer.SetComputeIntParam(sdfGradientShader, sp_textureDimension, (int)textureDimension);
-                    jumpFloodCommandBuffer.SetComputeMatrixParam(sdfGradientShader, sp_projectionToWorld, projectionToWorldMatrix);
-                    jumpFloodCommandBuffer.DispatchCompute(
-                        sdfGradientShader,
-                        sdfKernel,
-                        voronoiPingPongTexture0.width / 8,
-                        voronoiPingPongTexture0.height / 8,
-                        1
-                    );
-                    Graphics.ExecuteCommandBuffer(jumpFloodCommandBuffer);
-                }
-                DrawCacheQuad(ref _drawDepthCacheQuad, "SDFCache_", OceanDepthCacheType.Baked, _type == OceanDepthCacheType.Baked ? (Texture)_savedCache : _depthCacheTexture);
-
-                voronoiPingPongTexture0.DiscardContents();
-                voronoiPingPongTexture1.DiscardContents();
+                _drawCacheQuad.name = "DepthCache_" + gameObject.name + "_NOSAVE";
+                _drawCacheQuad.transform.SetParent(transform, false);
+                _drawCacheQuad.transform.localEulerAngles = 90f * Vector3.right;
+                _drawCacheQuad.AddComponent<RegisterSeaFloorDepthInput>()._assignOceanDepthMaterial = false;
+                qr = _drawCacheQuad.GetComponent<Renderer>();
+                qr.sharedMaterial = new Material(Shader.Find(LodDataMgrSeaFloorDepth.ShaderName));
             }
             else
             {
-                DrawCacheQuad(ref _drawDepthCacheQuad, "DepthCache_", _type, _type == OceanDepthCacheType.Baked ? (Texture)_savedCache : _depthCacheTexture);
+                qr = _drawCacheQuad.GetComponent<Renderer>();
             }
+
+            if (_type == OceanDepthCacheType.Baked)
+            {
+                qr.sharedMaterial.mainTexture = _savedCache;
+            }
+            else
+            {
+                qr.sharedMaterial.mainTexture = _cacheTexture;
+            }
+
+            qr.enabled = false;
         }
 
-        private static void ApplyJumpFlood(
-            CommandBuffer jumpFloodCommandBuffer,
-            ComputeShader jumpFloodShader,
-            int kernel,
-            int sp_jumpSize, uint jumpSize,
-            int sp_textureDimension, uint textureDimension,
-            int sp_projectionToWorld, Matrix4x4 projectionToWorld,
-            int sp_FromTexture, RenderTexture fromTexture,
-            int sp_ToTexture, RenderTexture toTexture
-        )
+        /// <summary>
+        /// Populates the ocean depth cache. Call this method if using <i>On Demand<i>.
+        /// </summary>
+        /// <param name="updateComponents">
+        /// Updates components like the depth cache camera. Pass true if you have changed any depth cache properties.
+        /// </param>
+        public void PopulateCache(bool updateComponents = false)
         {
-            jumpFloodCommandBuffer.SetComputeIntParam(jumpFloodShader, sp_jumpSize, (int)jumpSize);
-            jumpFloodCommandBuffer.SetComputeIntParam(jumpFloodShader, sp_textureDimension, (int)textureDimension);
-            jumpFloodCommandBuffer.SetComputeMatrixParam(jumpFloodShader, sp_projectionToWorld, projectionToWorld);
-            jumpFloodCommandBuffer.SetComputeTextureParam(jumpFloodShader, kernel, sp_FromTexture, fromTexture);
-            jumpFloodCommandBuffer.SetComputeTextureParam(jumpFloodShader, kernel, sp_ToTexture, toTexture);
-            jumpFloodCommandBuffer.DispatchCompute(
-                jumpFloodShader,
-                kernel,
-                fromTexture.width / 8,
-                fromTexture.height / 8,
-                1
-            );
-        }
-
-        private static Camera GenerateCacheCamera(
-            int layerMask,
-            string cameraName,
-            float cameraMaxTerrainHeight,
-            Transform transform,
-            RenderTexture cacheTexture,
-            bool hideDepthCacheCam
-        )
-        {
-            Camera camDepthCache = new GameObject(cameraName).AddComponent<Camera>();
-            camDepthCache.gameObject.hideFlags = hideDepthCacheCam ? HideFlags.HideAndDontSave : HideFlags.DontSave;
-            camDepthCache.transform.position = transform.position + Vector3.up * cameraMaxTerrainHeight;
-            camDepthCache.transform.parent = transform;
-            camDepthCache.transform.localEulerAngles = 90f * Vector3.right;
-            camDepthCache.orthographic = true;
-            camDepthCache.orthographicSize = Mathf.Max(transform.lossyScale.x / 2f, transform.lossyScale.z / 2f);
-            camDepthCache.targetTexture = cacheTexture;
-            camDepthCache.cullingMask = layerMask;
-            camDepthCache.clearFlags = CameraClearFlags.SolidColor;
-            // Clear to 'very deep'
-            camDepthCache.backgroundColor = Color.white * 1000f;
-            camDepthCache.enabled = false;
-            camDepthCache.allowMSAA = false;
-            // Stops behaviour from changing in VR. I tried disabling XR before/after camera render but it makes the editor
-            // go bonkers with split windows.
-            camDepthCache.cameraType = CameraType.Reflection;
-            // I'd prefer to destroy the cam object, but I found sometimes (on first start of editor) it will fail to render.
-            camDepthCache.gameObject.SetActive(false);
-            return camDepthCache;
-        }
-
-        void DrawCacheQuad(ref GameObject drawCacheQuad, string name, OceanDepthCacheType type, Texture texture)
-        {
-            if (drawCacheQuad != null)
+            // Nothing to populate for baked.
+            if (_type == OceanDepthCacheType.Baked)
             {
                 return;
             }
-            drawCacheQuad = GameObject.CreatePrimitive(PrimitiveType.Quad);
-            drawCacheQuad.hideFlags = HideFlags.DontSave;
-#if UNITY_EDITOR
-            DestroyImmediate(drawCacheQuad.GetComponent<Collider>());
-#else
-            Destroy(drawCacheQuad.GetComponent<Collider>());
-#endif
-            drawCacheQuad.name = "DepthCache_" + gameObject.name;
-            drawCacheQuad.transform.SetParent(transform, false);
-            drawCacheQuad.transform.localEulerAngles = 90f * Vector3.right;
-            drawCacheQuad.AddComponent<RegisterSeaFloorDepthInput>()._assignOceanDepthMaterial = false;
-            var qr = drawCacheQuad.GetComponent<Renderer>();
-            qr.sharedMaterial = new Material(Shader.Find(LodDataMgrSeaFloorDepth.ShaderName));
-            if (_type == OceanDepthCacheType.Baked)
+
+            // Make sure we have required objects.
+            if (!InitObjects(updateComponents))
             {
-                qr.sharedMaterial.mainTexture = texture;
+                return;
             }
-            else
+
+            // Render scene, saving depths in depth buffer.
+            _camDepthCache.Render();
+
+            if (_copyDepthMaterial == null)
             {
-                qr.sharedMaterial.mainTexture = texture;
+                _copyDepthMaterial = new Material(Shader.Find("Crest/Copy Depth Buffer Into Cache"));
             }
-            qr.enabled = false;
+
+            // Shader needs sea level to determine water depth. Ocean instance might not be available in prefabs.
+            var centerPoint = Vector3.zero;
+            centerPoint.y = OceanRenderer.Instance != null
+                ? OceanRenderer.Instance.Root.position.y : transform.position.y;
+
+            _copyDepthMaterial.SetVector("_OceanCenterPosWorld", centerPoint);
+
+            _copyDepthMaterial.SetTexture("_CamDepthBuffer", _camDepthCache.targetTexture);
+
+            // Zbuffer params
+            //float4 _ZBufferParams;            // x: 1-far/near,     y: far/near, z: x/far,     w: y/far
+            float near = _camDepthCache.nearClipPlane, far = _camDepthCache.farClipPlane;
+            _copyDepthMaterial.SetVector("_CustomZBufferParams", new Vector4(1f - far / near, far / near, (1f - far / near) / far, (far / near) / far));
+
+            // Altitudes for near and far planes
+            float ymax = _camDepthCache.transform.position.y - near;
+            float ymin = ymax - far;
+            _copyDepthMaterial.SetVector("_HeightNearHeightFar", new Vector2(ymax, ymin));
+
+            // Copy from depth buffer into the cache
+            Graphics.Blit(null, _cacheTexture, _copyDepthMaterial);
         }
 
 #if UNITY_EDITOR
@@ -455,7 +333,7 @@ namespace Crest
     [CustomEditor(typeof(OceanDepthCache))]
     public class OceanDepthCacheEditor : ValidatedEditor
     {
-        readonly string[] _propertiesToExclude = new string[] { "m_Script", "_type", "_refreshMode", "_savedCache", "_geometryToRenderIntoCache", "_layerNames", "_resolution", "_cameraMaxTerrainHeight", "_forceAlwaysUpdateDebug", "_checkTerrainDrawInstancedOption", "_refreshEveryFrameInEditMode" };
+        readonly string[] _propertiesToExclude = new string[] { "m_Script", "_type", "_refreshMode", "_savedCache", "_layers", "_resolution", "_cameraMaxTerrainHeight", "_forceAlwaysUpdateDebug" };
 
         public override void OnInspectorGUI()
         {
@@ -477,12 +355,10 @@ namespace Crest
             {
                 // Only expose the following if real-time cache type
                 EditorGUILayout.PropertyField(serializedObject.FindProperty("_refreshMode"));
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("_geometryToRenderIntoCache"), true);
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("_layerNames"), true);
+                EditorGUILayout.PropertyField(serializedObject.FindProperty("_layers"));
                 EditorGUILayout.PropertyField(serializedObject.FindProperty("_resolution"));
                 EditorGUILayout.PropertyField(serializedObject.FindProperty("_cameraMaxTerrainHeight"));
                 EditorGUILayout.PropertyField(serializedObject.FindProperty("_forceAlwaysUpdateDebug"));
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("_checkTerrainDrawInstancedOption"));
             }
             else
             {
@@ -506,7 +382,7 @@ namespace Crest
 
             if ((!playing || isOnDemand) && dc.Type != OceanDepthCache.OceanDepthCacheType.Baked && GUILayout.Button("Populate cache"))
             {
-                dc.PopulateCache();
+                dc.PopulateCache(updateComponents: true);
             }
 
             if (isBakeable && GUILayout.Button("Save cache to file"))
@@ -541,9 +417,32 @@ namespace Crest
 
     public partial class OceanDepthCache : IValidated
     {
+        bool IsCacheOutdated()
+        {
+            return _camDepthCache.orthographicSize != CalculateCacheCameraOrthographicSize() ||
+                _camDepthCache.transform.position != CalculateCacheCameraPosition() ||
+                IsCacheTextureOutdated(_camDepthCache.targetTexture) ||
+                IsCacheTextureOutdated(_cacheTexture);
+        }
+
         public bool Validate(OceanRenderer ocean, ValidatedHelper.ShowMessage showMessage)
         {
             var isValid = true;
+
+            isValid = ValidateObsolete(ocean, showMessage);
+
+            if (_camDepthCache != null && _camDepthCache.targetTexture != null && _cacheTexture != null)
+            {
+                if (IsCacheOutdated())
+                {
+                    showMessage
+                    (
+                        "Depth cache is outdated. Click <i>Populate Cache</i> or re-bake the cache to bring the cache " +
+                        "up-to-date with component changes.",
+                        ValidatedHelper.MessageType.Warning, this
+                    );
+                }
+            }
 
             if (_type == OceanDepthCacheType.Baked)
             {
@@ -560,11 +459,11 @@ namespace Crest
             }
             else
             {
-                if (_geometryToRenderIntoCache.Length == 0 && _layerNames.Length == 0)
+                if (_layers == 0)
                 {
                     showMessage
                     (
-                        "No layers specified for rendering into depth cache, and no geometries manually provided.",
+                        "No layers specified for rendering into depth cache.",
                         ValidatedHelper.MessageType.Error, this
                     );
 
@@ -582,33 +481,6 @@ namespace Crest
                     isValid = false;
                 }
 
-                foreach (var layerName in _layerNames)
-                {
-                    if (string.IsNullOrEmpty(layerName))
-                    {
-                        showMessage
-                        (
-                            "An empty layer name was provided. Please provide a valid layer name.",
-                            ValidatedHelper.MessageType.Error, this
-                        );
-
-                        isValid = false;
-                        continue;
-                    }
-
-                    var layer = LayerMask.NameToLayer(layerName);
-                    if (layer == -1)
-                    {
-                        showMessage
-                        (
-                            $"Invalid layer specified for objects/geometry providing the ocean depth: <i>{layerName}</i>. Please add this layer to the project by putting the name in an empty layer slot in <i>Edit/Project Settings/Tags and Layers</i>?",
-                            ValidatedHelper.MessageType.Error, this
-                        );
-
-                        isValid = false;
-                    }
-                }
-
                 if (_resolution < 4)
                 {
                     showMessage
@@ -620,8 +492,20 @@ namespace Crest
                     isValid = false;
                 }
 
-                // We used to test if nothing is present that would render into the cache, but these could probably come from other scenes, and AssignLayer means
-                // objects can be tagged up at run-time.
+                if (!Mathf.Approximately(transform.lossyScale.x, transform.lossyScale.z))
+                {
+                    showMessage
+                    (
+                        "The <i>Ocean Depth Cache</i> in realtime only supports a uniform scale for X and Z. " +
+                        "These values currently do not match. " +
+                        $"Its current scale in the hierarchy is: X = {transform.lossyScale.x} Z = {transform.lossyScale.z}.",
+                        ValidatedHelper.MessageType.Error, this
+                    );
+
+                    isValid = false;
+                }
+
+                // We used to test if nothing is present that would render into the cache, but these could probably come from other scenes.
             }
 
             if (transform.lossyScale.magnitude < 5f)
@@ -661,7 +545,7 @@ namespace Crest
             var renderers = GetComponentsInChildren<Renderer>();
             if (renderers.Length > (Application.isPlaying ? 1 : 0))
             {
-                Renderer quadRenderer = _drawDepthCacheQuad ? _drawDepthCacheQuad.GetComponent<Renderer>() : null;
+                Renderer quadRenderer = _drawCacheQuad ? _drawCacheQuad.GetComponent<Renderer>() : null;
 
                 foreach (var renderer in renderers)
                 {
@@ -683,6 +567,31 @@ namespace Crest
 
             return isValid;
         }
+
+#pragma warning disable 0618
+        public bool ValidateObsolete(OceanRenderer ocean, ValidatedHelper.ShowMessage showMessage)
+        {
+            var isValid = true;
+
+            if (_layerNames?.Length > 0)
+            {
+                showMessage
+                (
+                    "<i>Layer Names</i> on the <i>Ocean Depth Cache</i> is obsolete and is no longer used. " +
+                    "Use <i>Layers</i> instead.",
+                    ValidatedHelper.MessageType.Error, this, (SerializedObject serializedObject) =>
+                    {
+                        serializedObject.FindProperty("_layers").intValue = LayerMask.GetMask(_layerNames);
+                        serializedObject.FindProperty("_layerNames").arraySize = 0;
+                    }
+                );
+
+                isValid = false;
+            }
+
+            return isValid;
+        }
+#pragma warning restore 0618
     }
 #endif
 }
