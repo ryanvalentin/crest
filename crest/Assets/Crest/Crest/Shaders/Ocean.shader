@@ -263,6 +263,13 @@ Shader "Crest/Ocean"
 			#include "UnityCG.cginc"
 			#include "Lighting.cginc"
 
+			// Added by Ryan: Overcloud compatibility
+			/*
+			On line 214, under '#include "Lighting.cginc"', add:
+			*/
+			#include "../../../OverCloud/OverCloudInclude.cginc"
+            // End added by Ryan.
+
 			#include "OceanGlobals.hlsl"
 			#include "OceanInputsDriven.hlsl"
 			#include "OceanShaderData.hlsl"
@@ -274,13 +281,6 @@ Shader "Crest/Ocean"
 			#include "OceanNormalMapping.hlsl"
 			#include "OceanReflection.hlsl"
 			#include "OceanFoam.hlsl"
-
-			// Added by Ryan: Overcloud compatibility
-			/*
-			On line 214, under '#include "Lighting.cginc"', add:
-			*/
-			#include "../../../OverCloud/OverCloudInclude.cginc"
-            // End added by Ryan.
 
 			struct Attributes
 			{
