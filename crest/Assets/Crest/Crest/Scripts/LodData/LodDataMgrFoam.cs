@@ -3,6 +3,7 @@
 // This file is subject to the MIT License as seen in the root of this folder structure (LICENSE)
 
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 
 namespace Crest
 {
@@ -16,7 +17,12 @@ namespace Crest
         protected override string ShaderSim { get { return "UpdateFoam"; } }
         protected override int krnl_ShaderSim { get { return _shader.FindKernel(ShaderSim); } }
         public override string SimName { get { return "Foam"; } }
-        public override RenderTextureFormat TextureFormat { get { return Settings._renderTextureFormat; } }
+        protected override GraphicsFormat RequestedTextureFormat => Settings._renderTextureGraphicsFormat;
+
+        internal const string MATERIAL_KEYWORD_PROPERTY = "_Foam";
+        internal const string MATERIAL_KEYWORD = MATERIAL_KEYWORD_PREFIX + "_FOAM_ON";
+        internal const string ERROR_MATERIAL_KEYWORD_MISSING = "Foam must be enabled on the ocean material. Tick the <i>Enable</i> option in the <i>Foam</i> parameter section on the material currently assigned to the OceanRenderer component.";
+        internal const string ERROR_MATERIAL_KEYWORD_ON_FEATURE_OFF = "The Foam feature is disabled on this component but is enabled on the ocean material. If this is not intentional, either enable the <i>Create Foam Sim</i> option on this component to turn it on, or disable the Foam feature on the ocean material to save performance.";
 
         readonly int sp_FoamFadeRate = Shader.PropertyToID("_FoamFadeRate");
         readonly int sp_WaveFoamStrength = Shader.PropertyToID("_WaveFoamStrength");
@@ -50,10 +56,11 @@ namespace Crest
             base.Start();
 
 #if UNITY_EDITOR
-            if (OceanRenderer.Instance != null && OceanRenderer.Instance.OceanMaterial != null
-                && !OceanRenderer.Instance.OceanMaterial.IsKeywordEnabled("_FOAM_ON"))
+            if (OceanRenderer.Instance.OceanMaterial != null
+                && OceanRenderer.Instance.OceanMaterial.HasProperty(MATERIAL_KEYWORD_PROPERTY)
+                && !OceanRenderer.Instance.OceanMaterial.IsKeywordEnabled(MATERIAL_KEYWORD))
             {
-                Debug.LogWarning("Foam is not enabled on the current ocean material and will not be visible.", _ocean);
+                Debug.LogWarning(ERROR_MATERIAL_KEYWORD_MISSING, _ocean);
             }
 #endif
         }
@@ -78,11 +85,11 @@ namespace Crest
             LodDataMgrFlow.Bind(simMaterial);
         }
 
-        public override void GetSimSubstepData(float frameDt, out int numSubsteps, out float substepDt)
+        protected override void GetSimSubstepData(float timeToSimulate, out int numSubsteps, out float substepDt)
         {
-            // foam always does just one sim step
-            substepDt = frameDt;
-            numSubsteps = 1;
+            numSubsteps = Mathf.FloorToInt(timeToSimulate * Settings._simulationFrequency);
+
+            substepDt = numSubsteps > 0 ? (1f / Settings._simulationFrequency) : 0f;
         }
 
         readonly static string s_textureArrayName = "_LD_TexArray_Foam";
